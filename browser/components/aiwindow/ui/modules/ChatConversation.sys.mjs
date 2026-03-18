@@ -177,6 +177,10 @@ export class ChatConversation extends EventEmitter {
       .at(-1);
   }
 
+  getLastAssistantResponse() {
+    return this.#getCurrentAssistantResponse();
+  }
+
   /**
    * Returns a filtered messages array consisting only of the messages
    * that are meant to be rendered as the chat conversation.

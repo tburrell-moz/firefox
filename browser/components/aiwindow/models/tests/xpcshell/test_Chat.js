@@ -823,3 +823,449 @@ add_task(
     }
   }
 );
+
+// URL ID substitution tests
+
+add_task(async function test_Chat_url_ids_restored_in_final_response() {
+  // get_page_content returns content with a URL.
+  // The model responds using [URL_1] in its text.
+  // fetchWithHistory must restore [URL_1] → real URL in the final message.
+  const sb = sinon.createSandbox();
+  try {
+    const pageUrl = "https://example.com/product/great-pan";
+    let callCount = 0;
+    const fakeEngine = {
+      runWithGenerator(_options) {
+        callCount++;
+        async function* gen() {
+          if (callCount === 1) {
+            yield {
+              toolCalls: [
+                {
+                  id: "call_gpc",
+                  function: {
+                    name: "get_page_content",
+                    arguments: JSON.stringify({ url_list: [pageUrl] }),
+                  },
+                },
+              ],
+            };
+          } else {
+            yield { text: `Buy it at [URL_1].` };
+          }
+        }
+        return gen();
+      },
+      getConfig() {
+        return {};
+      },
+    };
+
+    sb.stub(Chat.toolMap, "get_page_content").resolves([
+      `The best pan. Buy here: ${pageUrl}`,
+    ]);
+    sb.stub(openAIEngine, "build").resolves(fakeEngine);
+    sb.stub(openAIEngine, "getFxAccountToken").resolves("mock_token");
+
+    const conversation = new ChatConversation({
+      title: "url id test",
+      description: "",
+      pageUrl: new URL("https://www.firefox.com"),
+      pageMeta: {},
+    });
+    conversation.addUserMessage("Find me a pan", "https://www.firefox.com", 0);
+    conversation.addAssistantMessage("text", "");
+
+    const engineInstance = await openAIEngine.build(MODEL_FEATURES.CHAT);
+    await Chat.fetchWithHistory(conversation, engineInstance);
+
+    const finalBody = getLastAssistantResponse(conversation).content.body;
+    Assert.ok(
+      finalBody.includes(pageUrl),
+      `[URL_1] should be restored to ${pageUrl} in final response, got: ${finalBody}`
+    );
+    Assert.ok(
+      !finalBody.includes("[URL_1]"),
+      `[URL_1] token should not remain in final response`
+    );
+  } finally {
+    sb.restore();
+  }
+});
+
+add_task(async function test_Chat_hallucinated_urls_defanged_when_page_content_fetched() {
+  // When get_page_content is called, any URL the model outputs that was NOT
+  // from the page content should be defanged (wrapped in backticks).
+  const sb = sinon.createSandbox();
+  try {
+    const realUrl = "https://example.com/product/great-pan";
+    const hallucinatedUrl = "https://hallucinated.com/fake-product";
+    let callCount = 0;
+    const fakeEngine = {
+      runWithGenerator(_options) {
+        callCount++;
+        async function* gen() {
+          if (callCount === 1) {
+            yield {
+              toolCalls: [
+                {
+                  id: "call_gpc",
+                  function: {
+                    name: "get_page_content",
+                    arguments: JSON.stringify({ url_list: [realUrl] }),
+                  },
+                },
+              ],
+            };
+          } else {
+            yield {
+              text: `See [URL_1] or [the fake one](${hallucinatedUrl}).`,
+            };
+          }
+        }
+        return gen();
+      },
+      getConfig() {
+        return {};
+      },
+    };
+
+    sb.stub(Chat.toolMap, "get_page_content").resolves([
+      `Great pan at ${realUrl}`,
+    ]);
+    sb.stub(openAIEngine, "build").resolves(fakeEngine);
+    sb.stub(openAIEngine, "getFxAccountToken").resolves("mock_token");
+
+    const conversation = new ChatConversation({
+      title: "defang test",
+      description: "",
+      pageUrl: new URL("https://www.firefox.com"),
+      pageMeta: {},
+    });
+    conversation.addUserMessage(
+      "Tell me about pans",
+      "https://www.firefox.com",
+      0
+    );
+    conversation.addAssistantMessage("text", "");
+
+    const engineInstance = await openAIEngine.build(MODEL_FEATURES.CHAT);
+    await Chat.fetchWithHistory(conversation, engineInstance);
+
+    const finalBody = getLastAssistantResponse(conversation).content.body;
+    Assert.ok(
+      finalBody.includes(realUrl),
+      `Real URL should be present: ${realUrl}`
+    );
+    Assert.ok(
+      !finalBody.includes(`](${hallucinatedUrl})`),
+      `Hallucinated markdown link should be stripped`
+    );
+    Assert.ok(
+      finalBody.includes("the fake one"),
+      `Link text should be preserved when markdown link is stripped`
+    );
+  } finally {
+    sb.restore();
+  }
+});
+
+add_task(async function test_Chat_no_defanging_without_page_content() {
+  // When neither get_page_content nor run_search is called,
+  // defanging does not run and URLs in the response pass through as-is.
+  const sb = sinon.createSandbox();
+  try {
+    const someUrl = "https://example.com/some-page";
+    const fakeEngine = {
+      runWithGenerator(_options) {
+        async function* gen() {
+          yield { text: `Check out ${someUrl} for info.` };
+        }
+        return gen();
+      },
+      getConfig() {
+        return {};
+      },
+    };
+
+    sb.stub(openAIEngine, "build").resolves(fakeEngine);
+    sb.stub(openAIEngine, "getFxAccountToken").resolves("mock_token");
+
+    const conversation = new ChatConversation({
+      title: "no defang test",
+      description: "",
+      pageUrl: new URL("https://www.firefox.com"),
+      pageMeta: {},
+    });
+    conversation.addUserMessage(
+      "Tell me something",
+      "https://www.firefox.com",
+      0
+    );
+    conversation.addAssistantMessage("text", "");
+
+    const engineInstance = await openAIEngine.build(MODEL_FEATURES.CHAT);
+    await Chat.fetchWithHistory(conversation, engineInstance);
+
+    const finalBody = getLastAssistantResponse(conversation).content.body;
+    Assert.ok(
+      finalBody.includes(someUrl),
+      `URL should pass through unchanged when no page content was fetched`
+    );
+  } finally {
+    sb.restore();
+  }
+});
+
+add_task(async function test_Chat_url_id_map_persists_across_fetchWithHistory_calls_same_turn() {
+  // The urlIdMap must persist across two fetchWithHistory calls on the same
+  // turn (simulating the run_search handoff: first call exits early, sidebar
+  // opens a second call that continues the conversation).
+  const sb = sinon.createSandbox();
+  try {
+    const pageUrl = "https://example.com/review/best-pans";
+    let callCount = 0;
+    const fakeEngine = {
+      runWithGenerator(_options) {
+        callCount++;
+        async function* gen() {
+          if (callCount === 1) {
+            yield {
+              toolCalls: [
+                {
+                  id: "call_gpc",
+                  function: {
+                    name: "get_page_content",
+                    arguments: JSON.stringify({ url_list: [pageUrl] }),
+                  },
+                },
+              ],
+            };
+          } else {
+            yield { text: `The best pan is at [URL_1].` };
+          }
+        }
+        return gen();
+      },
+      getConfig() {
+        return {};
+      },
+    };
+
+    sb.stub(Chat.toolMap, "get_page_content").resolves([
+      `Top pick: ${pageUrl}`,
+    ]);
+    sb.stub(openAIEngine, "build").resolves(fakeEngine);
+    sb.stub(openAIEngine, "getFxAccountToken").resolves("mock_token");
+
+    const conversation = new ChatConversation({
+      title: "persist urlIdMap test",
+      description: "",
+      pageUrl: new URL("https://www.firefox.com"),
+      pageMeta: {},
+    });
+    conversation.addUserMessage(
+      "Best pan?",
+      "https://www.firefox.com",
+      0
+    );
+    conversation.addAssistantMessage("text", "");
+
+    const engineInstance = await openAIEngine.build(MODEL_FEATURES.CHAT);
+
+    // First fetchWithHistory: get_page_content populates urlIdMap
+    await Chat.fetchWithHistory(conversation, engineInstance);
+
+    // Simulate sidebar opening a second call on the same turn (same turn index)
+    conversation.addAssistantMessage("text", "");
+    callCount = 1; // skip back to the part that yields the text response
+    await Chat.fetchWithHistory(conversation, engineInstance);
+
+    const finalBody = getLastAssistantResponse(conversation).content.body;
+    Assert.ok(
+      finalBody.includes(pageUrl),
+      `[URL_1] should be restored using urlIdMap from first call: ${finalBody}`
+    );
+  } finally {
+    sb.restore();
+  }
+});
+
+add_task(async function test_Chat_run_search_url_ids_replaced_and_defanging_runs() {
+  // run_search result URLs should be replaced with [URL_n] IDs.
+  // Any URL the model outputs that wasn't in the SERP should be defanged.
+  const sb = sinon.createSandbox();
+  try {
+    const serpUrl = "https://reddit.com/r/cooking/comments/abc123/review";
+    const hallucinatedUrl = "https://hallucinated.com/fake-product";
+    let callCount = 0;
+    const fakeEngine = {
+      runWithGenerator(_options) {
+        callCount++;
+        async function* gen() {
+          if (callCount === 1) {
+            yield {
+              toolCalls: [
+                {
+                  id: "call_search",
+                  function: {
+                    name: "run_search",
+                    arguments: JSON.stringify({ query: "best pans" }),
+                  },
+                },
+              ],
+            };
+          } else {
+            // Model cites the SERP URL by ID and also hallucinates a URL
+            yield {
+              text: `Check [URL_1] or try ${hallucinatedUrl}.`,
+            };
+          }
+        }
+        return gen();
+      },
+      getConfig() {
+        return {};
+      },
+    };
+
+    const runSearchStub = sb
+      .stub(Chat.toolMap, "run_search")
+      .resolves(`Search results:\n\nSee ${serpUrl} for details.`);
+    sb.stub(openAIEngine, "build").resolves(fakeEngine);
+    sb.stub(openAIEngine, "getFxAccountToken").resolves("mock_token");
+
+    const mockBrowser = {
+      ownerGlobal: {
+        closed: false,
+        gBrowser: {
+          getTabForBrowser: () => ({ selected: true }),
+          selectedTab: null,
+        },
+      },
+    };
+    const { AIWindow } = ChromeUtils.importESModule(
+      "moz-src:///browser/components/aiwindow/ui/modules/AIWindow.sys.mjs"
+    );
+    const origOpenSidebar = AIWindow.openSidebarAndContinue;
+    AIWindow.openSidebarAndContinue = () => {};
+
+    const conversation = new ChatConversation({
+      title: "run_search url id test",
+      description: "",
+      pageUrl: new URL("https://www.firefox.com"),
+      pageMeta: {},
+    });
+    conversation.addUserMessage(
+      "Best pans?",
+      "https://www.firefox.com",
+      0
+    );
+    conversation.addAssistantMessage("text", "");
+
+    const context = {
+      browsingContext: { embedderElement: mockBrowser },
+    };
+
+    const engineInstance = await openAIEngine.build(MODEL_FEATURES.CHAT);
+
+    // First call: run_search fires and returns early (handoff)
+    await Chat.fetchWithHistory(conversation, engineInstance, context);
+
+    // Simulate sidebar continuation: second fetchWithHistory on same turn
+    conversation.addAssistantMessage("text", "");
+    callCount = 1;
+    await Chat.fetchWithHistory(conversation, engineInstance, context);
+
+    const finalBody = getLastAssistantResponse(conversation).content.body;
+    Assert.ok(
+      finalBody.includes(serpUrl),
+      `SERP URL should be restored from [URL_1]: ${finalBody}`
+    );
+    Assert.ok(
+      finalBody.includes(`\`${hallucinatedUrl}\``),
+      `Hallucinated URL should be wrapped in backticks (defanged): ${finalBody}`
+    );
+
+    AIWindow.openSidebarAndContinue = origOpenSidebar;
+  } finally {
+    sb.restore();
+  }
+});
+
+add_task(async function test_Chat_defangs_when_page_content_called_but_no_urls_in_content() {
+  // If get_page_content is called but the page has no extractable URLs
+  // (e.g. a SERP page with only breadcrumb-format URLs), urlIdMap stays empty.
+  // Defanging should still run — the model must not generate links from memory.
+  const sb = sinon.createSandbox();
+  try {
+    const hallucinatedUrl = "https://example.com/hallucinated";
+    let callCount = 0;
+    const fakeEngine = {
+      runWithGenerator(_options) {
+        callCount++;
+        async function* gen() {
+          if (callCount === 1) {
+            yield {
+              toolCalls: [
+                {
+                  id: "call_gpc",
+                  function: {
+                    name: "get_page_content",
+                    arguments: JSON.stringify({
+                      url_list: ["https://some-page.com"],
+                    }),
+                  },
+                },
+              ],
+            };
+          } else {
+            // Model ignores prompt instruction and generates a URL from memory
+            yield {
+              text: `Check out [this](${hallucinatedUrl}) for details.`,
+            };
+          }
+        }
+        return gen();
+      },
+      getConfig() {
+        return {};
+      },
+    };
+
+    // Page content has no https:// URLs — only plain text
+    sb.stub(Chat.toolMap, "get_page_content").resolves([
+      "This page has no links, just text about products.",
+    ]);
+    sb.stub(openAIEngine, "build").resolves(fakeEngine);
+    sb.stub(openAIEngine, "getFxAccountToken").resolves("mock_token");
+
+    const conversation = new ChatConversation({
+      title: "defang no url content test",
+      description: "",
+      pageUrl: new URL("https://www.firefox.com"),
+      pageMeta: {},
+    });
+    conversation.addUserMessage(
+      "Give me links",
+      "https://www.firefox.com",
+      0
+    );
+    conversation.addAssistantMessage("text", "");
+
+    const engineInstance = await openAIEngine.build(MODEL_FEATURES.CHAT);
+    await Chat.fetchWithHistory(conversation, engineInstance);
+
+    const finalBody = getLastAssistantResponse(conversation).content.body;
+    Assert.ok(
+      !finalBody.includes(`](${hallucinatedUrl})`),
+      `Hallucinated markdown link should be stripped even when urlIdMap is empty`
+    );
+    Assert.ok(
+      finalBody.includes("this"),
+      `Link text should be preserved when markdown link is stripped`
+    );
+  } finally {
+    sb.restore();
+  }
+});

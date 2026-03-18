@@ -57,6 +57,27 @@ const modelPrefObserver = {
 };
 Services.prefs.addObserver(MODEL_PREF, modelPrefObserver);
 
+// URLs in run_search and get_page_content results are replaced with short
+// [URL_n] ID tags to prevent hallucination. This suffix tells the model how
+// to use those IDs and instructs it never to invent URLs.
+const URL_ID_SYSTEM_PROMPT_SUFFIX = `
+
+## Linking and citations — OVERRIDE (highest priority, supersedes all other citation rules above)
+These rules override any earlier instructions about links, URLs, or citations:
+- **NEVER write a URL string in your response.** Not even for well-known sites like amazon.com, wayfair.com, wirecutter.com, or any product page. Any URL you write from memory will be removed.
+- **NEVER construct or reconstruct a URL from memory**, even if you are certain it exists.
+- URLs in tool results are replaced with ID tags like [URL_1], [URL_2], etc. You may use those IDs as link targets, e.g. [link text]([URL_1]).
+- **URL IDs only exist if they appear literally in the tool result text** (e.g. the text contains "[URL_1]", "[URL_2]"). If no [URL_n] tokens appear in the tool result, then NO URL IDs were assigned — do NOT invent any.
+- **When tool results already contain [text]([URL_n]) links, carry those exact IDs into your response.** Do not replace them with a fabricated URL — the ID is already correct.
+- **If no URL ID exists for something, name it without a link.** Do NOT invent a URL to satisfy a citation requirement. A name-only mention is correct; a fabricated link is a violation.
+- When a product has no URL ID, mention the product name and retailer as plain text. If a review article or discussion thread ID is available for that product, use that as the link instead.
+
+Concrete example — search results contain "All-Clad D3 3-Qt Saucepan $149.95 Williams-Sonoma" with no URL ID, but do contain [URL_6] pointing to a Food & Wine saucepan review:
+- WRONG: [All-Clad Saucepan](https://www.williams-sonoma.com/products/all-clad-d3-3qt) — fabricated URL, will be stripped
+- WRONG: [All-Clad Saucepan](https://www.allclad.com/saucepan-3qt) — fabricated URL, will be stripped
+- RIGHT: [All-Clad D3 3-Qt Saucepan]([URL_6]) — links to the review that covers it
+- RIGHT: All-Clad D3 3-Qt Saucepan ($149.95 at Williams-Sonoma) — plain text when no relevant ID exists`;
+
 /**
  * Feature identifiers for AI Window model, configurations and prompts.
  * These are used to look up model configs, prompts, and inference parameters
@@ -511,7 +532,11 @@ export class openAIEngine {
   async loadPrompt(feature) {
     const config = this.getConfig(feature);
     if (config?.prompts) {
-      return config.prompts;
+      let prompt = config.prompts;
+      if (feature === MODEL_FEATURES.CHAT) {
+        prompt += URL_ID_SYSTEM_PROMPT_SUFFIX;
+      }
+      return prompt;
     }
 
     console.error(`Failed to load prompt for ${feature}`);

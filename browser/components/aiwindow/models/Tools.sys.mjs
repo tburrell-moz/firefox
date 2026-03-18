@@ -481,7 +481,8 @@ export class RunSearch {
     let result;
     try {
       await RunSearch.#performSearchAndWait(win, originalBrowser, query.trim());
-      result = RunSearch.#extractSerpContent(originalBrowser);
+      const extracted = await RunSearch.#extractSerpContent(originalBrowser);
+      result = extracted;
     } catch (e) {
       console.error("[RunSearch] search failed:", e);
       result = `Error performing search for "${query}": ${e.message}`;
@@ -576,29 +577,44 @@ export class RunSearch {
   static async #extractSerpContent(browser) {
     const windowContext = browser.browsingContext?.currentWindowContext;
     if (!windowContext) {
-      return "Error: could not access search results page content.";
+      return {
+        content: "Error: could not access search results page content.",
+        serpLinks: [],
+      };
     }
 
     const pageExtractor = await windowContext.getActor("PageExtractor");
-    let extraction;
+    let text = "";
+    let serpLinks = [];
+
     try {
-      extraction = await pageExtractor.getReaderModeContent();
+      const readerExtraction = await pageExtractor.getReaderModeContent();
+      text = readerExtraction?.text ?? "";
     } catch {
       // Fall back to full text extraction
     }
 
-    let text = extraction?.text ?? "";
-    if (!text) {
-      try {
-        extraction = await pageExtractor.getText();
-        text = extraction?.text ?? "";
-      } catch {
-        return "Error: failed to extract search results content.";
+    // Always call getText() to get link hrefs, and use its text as fallback.
+    try {
+      const fullExtraction = await pageExtractor.getText();
+      serpLinks = fullExtraction?.links ?? [];
+      if (!text) {
+        text = fullExtraction?.text ?? "";
+      }
+    } catch {
+      if (!text) {
+        return {
+          content: "Error: failed to extract search results content.",
+          serpLinks: [],
+        };
       }
     }
 
     if (!text) {
-      return "No content could be extracted from the search results page.";
+      return {
+        content: "No content could be extracted from the search results page.",
+        serpLinks: [],
+      };
     }
 
     let cleanContent = text
@@ -617,7 +633,10 @@ export class RunSearch {
     }
 
     const url = browser.currentURI?.spec || "unknown";
-    return `Search results from ${url}:\n\n${cleanContent}`;
+    return {
+      content: `Search results from ${url}:\n\n${cleanContent}`,
+      serpLinks,
+    };
   }
 }
 
@@ -860,6 +879,223 @@ export class GetPageContent {
 
     return `Content (${modeLabel}) from ${label}:\n\n${cleanContent}`;
   }
+}
+
+/**
+ * Resolves Google redirect URLs (https://www.google.com/url?q=...) to their
+ * actual destination. Returns the URL unchanged if it is not a Google redirect.
+ *
+ * @param {string} url
+ * @returns {string}
+ */
+function resolveGoogleRedirect(url) {
+  try {
+    const parsed = new URL(url);
+    if (
+      parsed.hostname === "www.google.com" &&
+      parsed.pathname === "/url"
+    ) {
+      const dest = parsed.searchParams.get("q");
+      if (dest && /^https?:\/\//.test(dest)) {
+        return dest;
+      }
+    }
+  } catch {
+    // not a valid URL
+  }
+  return url;
+}
+
+/**
+ * Returns true if the URL belongs to google.com and could not be resolved
+ * to an external destination (e.g. /search?, /maps, /images, etc.).
+ *
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isUnresolvableGoogleUrl(url) {
+  try {
+    const { hostname } = new URL(url);
+    return hostname === "www.google.com" || hostname === "google.com";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns true if the URL is a bare root domain with no meaningful path
+ * (e.g. https://www.allclad.com or https://www.allclad.com/).
+ * Root domain URLs are not useful as product/article citations.
+ *
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isRootDomainUrl(url) {
+  try {
+    const { pathname } = new URL(url);
+    return pathname === "" || pathname === "/";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Extracts allowed (non-root, non-Google) URLs from text.
+ * Applies the same filtering rules as replaceUrlsWithIds: resolves Google
+ * redirects, drops unresolvable Google URLs and root domain URLs.
+ *
+ * @param {string} text
+ * @returns {Set<string>}
+ */
+export function extractAllowedUrls(text) {
+  if (typeof text !== "string" || !text) {
+    return new Set();
+  }
+  const urls = new Set();
+  for (const [url] of text.matchAll(
+    /https?:\/\/[^\s"'<>()\[\]]+(?<![.,;:!?])/g
+  )) {
+    const resolved = resolveGoogleRedirect(url);
+    if (resolved === url && isUnresolvableGoogleUrl(url)) {
+      continue;
+    }
+    if (isRootDomainUrl(resolved)) {
+      continue;
+    }
+    urls.add(resolved);
+  }
+  return urls;
+}
+
+/**
+ * Replaces http/https URLs in text with short ID tags (e.g. [URL_1]).
+ * Google redirect URLs are resolved to their destination before mapping.
+ * Deduplicates: if a URL was already replaced, reuses the same tag.
+ *
+ * @param {string} text
+ * @param {Map<string, string>} urlIdMap - Maps ID strings (e.g. "URL_1") to original URLs
+ * @returns {string}
+ */
+export function replaceUrlsWithIds(text, urlIdMap) {
+  if (typeof text !== "string" || !text) {
+    return text;
+  }
+  const urlToId = new Map();
+  for (const [id, url] of urlIdMap) {
+    urlToId.set(url, id);
+  }
+  return text.replace(/https?:\/\/[^\s"'<>()\[\]]+(?<![.,;:!?])/g, url => {
+    const resolved = resolveGoogleRedirect(url);
+    // Google URLs that couldn't be resolved to an actual destination (e.g.
+    // /search? refinement links) are stripped so the LLM doesn't cite them.
+    if (resolved === url && isUnresolvableGoogleUrl(url)) {
+      return "";
+    }
+    if (isRootDomainUrl(resolved)) {
+      return "";
+    }
+    if (urlToId.has(resolved)) {
+      return `[${urlToId.get(resolved)}]`;
+    }
+    // If this URL is a base-path prefix of an already-stored longer URL
+    // (e.g. canonical /path vs /path/s?k=query), reuse the longer URL's ID
+    // so the LLM always resolves to the most specific version.
+    for (const [existingUrl, id] of urlToId) {
+      const next = existingUrl[resolved.length];
+      if (
+        existingUrl.startsWith(resolved) &&
+        existingUrl.length > resolved.length &&
+        (next === "/" || next === "?")
+      ) {
+        urlToId.set(resolved, id);
+        return `[${id}]`;
+      }
+    }
+    // If this URL extends an already-stored base URL with only junk
+    // (e.g. https://example.com/page?# or https://example.com/page??&#),
+    // reuse the base URL's ID instead of creating a new one.
+    for (const [existingUrl, id] of urlToId) {
+      const next = resolved[existingUrl.length];
+      if (
+        resolved.startsWith(existingUrl) &&
+        resolved.length > existingUrl.length &&
+        (next === "?" || next === "#")
+      ) {
+        urlToId.set(resolved, id);
+        return `[${id}]`;
+      }
+    }
+    const id = `URL_${urlIdMap.size + 1}`;
+    urlIdMap.set(id, resolved);
+    urlToId.set(resolved, id);
+    return `[${id}]`;
+  });
+}
+
+/**
+ * Replaces URL ID tags (e.g. [URL_1]) in text with their original URLs.
+ *
+ * @param {string} text
+ * @param {Map<string, string>} urlIdMap - Maps ID strings to original URLs
+ * @returns {string}
+ */
+export function restoreUrlIds(text, urlIdMap) {
+  if (typeof text !== "string" || !text || !urlIdMap.size) {
+    return text;
+  }
+  return text.replace(/\[URL_\d+\]/g, (tag, offset) => {
+    const id = tag.slice(1, -1);
+    const url = urlIdMap.get(id);
+    if (!url) {
+      return tag;
+    }
+    // Inside a markdown link href [text]([URL_n]) — return just the URL.
+    if (offset > 0 && text[offset - 1] === "(") {
+      return url;
+    }
+    // Bare token — wrap as a self-referencing markdown link so it's clickable.
+    return `[${url}](${url})`;
+  });
+}
+
+/**
+ * Defangs URLs in LLM response text that were not part of the URL
+ * reconstruction process (i.e. not in validUrls).
+ * - Markdown links [text](url) become plain text when url is not valid.
+ * - Bare URLs are wrapped in backticks to prevent auto-linking.
+ *
+ * @param {string} text
+ * @param {Set<string>} validUrls - URLs that came from the reconstruction process
+ * @returns {string}
+ */
+export function defangHallucinatedUrls(text, validUrls) {
+  if (typeof text !== "string" || !text) {
+    return text;
+  }
+  text = text.replace(
+    /\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g,
+    (match, linkText, url) => (validUrls.has(url) ? match : linkText)
+  );
+  text = text.replace(/(?<!\]\()https?:\/\/[^\s"'<>()\[\]]+(?<![.,;:!?])/g, url =>
+    validUrls.has(url) ? `[${url}](${url})` : `\`${url}\``
+  );
+  return text;
+}
+
+/**
+ * Strips any [URL_n] tokens that were not resolved by restoreUrlIds.
+ * Degrades markdown links [text]([URL_n]) to plain text, and drops bare tokens.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripUnresolvedUrlIds(text) {
+  if (typeof text !== "string" || !text) {
+    return text;
+  }
+  text = text.replace(/\[([^\]]+)\]\(\[URL_\d+\]\)/g, "$1");
+  text = text.replace(/\[URL_\d+\]/g, "");
+  return text;
 }
 
 /**

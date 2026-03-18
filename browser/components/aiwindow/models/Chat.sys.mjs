@@ -8,6 +8,11 @@ import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
 
 import { ToolRoleOpts } from "moz-src:///browser/components/aiwindow/ui/modules/ChatMessage.sys.mjs";
 import { openAIEngine } from "moz-src:///browser/components/aiwindow/models/Utils.sys.mjs";
+import { extractValidUrls } from "moz-src:///browser/components/aiwindow/models/ChatUtils.sys.mjs";
+import {
+  extractMarkdownLinks,
+  validateCitedUrls,
+} from "moz-src:///browser/components/aiwindow/models/CitationParser.sys.mjs";
 import {
   toolsConfig,
   getOpenTabs,
@@ -15,12 +20,11 @@ import {
   GetPageContent,
   RunSearch,
   getUserMemories,
+  replaceUrlsWithIds,
+  restoreUrlIds,
+  defangHallucinatedUrls,
+  stripUnresolvedUrlIds,
 } from "moz-src:///browser/components/aiwindow/models/Tools.sys.mjs";
-import { extractValidUrls } from "moz-src:///browser/components/aiwindow/models/ChatUtils.sys.mjs";
-import {
-  extractMarkdownLinks,
-  validateCitedUrls,
-} from "moz-src:///browser/components/aiwindow/models/CitationParser.sys.mjs";
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
@@ -86,19 +90,31 @@ Object.assign(Chat, {
       isVerbatimQuery = false;
     }
 
+    // urlIdMap maps [URL_n] IDs to the real URLs from get_page_content results.
+    // _pageContentFetched tracks whether get_page_content was called this turn
+    // (even if the content had no URLs). Both reset once per turn so the
+    // sidebar's continuation call reuses the same state.
+    if (conversation._urlIdMapTurn !== currentTurn) {
+      conversation.urlIdMap = new Map();
+      conversation._pageContentFetched = false;
+      conversation._urlIdMapTurn = currentTurn;
+    }
+    const urlIdMap = conversation.urlIdMap;
     const allAllowedUrls = new Set();
     let fullResponseText = "";
     const searchExecuted = conversation._searchExecutedTurn === currentTurn;
 
-    const streamModelResponse = () =>
-      engineInstance.runWithGenerator({
+    const streamModelResponse = () => {
+      const messages = conversation.getMessagesInOpenAiFormat();
+      return engineInstance.runWithGenerator({
         streamOptions: { enabled: true },
         fxAccountToken,
         tool_choice: "auto",
         tools: chatToolsConfig,
-        args: conversation.getMessagesInOpenAiFormat(),
+        args: messages,
         ...inferenceParams,
       });
+    };
 
     while (true) {
       let pendingToolCalls = null;
@@ -112,6 +128,43 @@ Object.assign(Chat, {
       } catch (err) {
         console.error("fetchWithHistory streaming error:", err);
         throw err;
+      }
+
+      // Restore [URL_n] IDs to real URLs, then defang any URLs the model
+      // generated that weren't from page content.
+      // Defang runs whenever get_page_content was called this turn — even if
+      // urlIdMap is empty (page had no extractable URLs), the model still
+      // shouldn't be generating links from training memory.
+      if (conversation._pageContentFetched) {
+        const validUrls = new Set(urlIdMap.values());
+        fullResponseText = restoreUrlIds(fullResponseText, urlIdMap);
+        if (validUrls.size > 0) {
+          fullResponseText = defangHallucinatedUrls(fullResponseText, validUrls);
+        }
+        const lastMsg = conversation.getLastAssistantResponse();
+        if (lastMsg?.content?.body) {
+          lastMsg.content.body = restoreUrlIds(lastMsg.content.body, urlIdMap);
+          if (validUrls.size > 0) {
+            lastMsg.content.body = defangHallucinatedUrls(
+              lastMsg.content.body,
+              validUrls
+            );
+          }
+          conversation.emit("chat-conversation:message-update", lastMsg);
+        }
+      }
+
+      // Always strip any [URL_n] tokens that weren't resolved (hallucinated IDs
+      // or no tool call made). Runs after restoreUrlIds so known IDs are already
+      // replaced; this only affects tokens that remain.
+      fullResponseText = stripUnresolvedUrlIds(fullResponseText);
+      const lastMsgForStrip = conversation.getLastAssistantResponse();
+      if (lastMsgForStrip?.content?.body) {
+        const stripped = stripUnresolvedUrlIds(lastMsgForStrip.content.body);
+        if (stripped !== lastMsgForStrip.content.body) {
+          lastMsgForStrip.content.body = stripped;
+          conversation.emit("chat-conversation:message-update", lastMsgForStrip);
+        }
       }
 
       if (!pendingToolCalls || pendingToolCalls.length === 0) {
@@ -208,9 +261,22 @@ Object.assign(Chat, {
             }
             searchHandoffBrowser = context.browsingContext.embedderElement;
             result = await toolFunc(params ?? {}, context, secProps);
+            if (result && typeof result === "object" && "content" in result) {
+              result = result.content;
+            }
+            if (typeof result === "string") {
+              result = replaceUrlsWithIds(result, urlIdMap);
+              conversation._pageContentFetched = true;
+            }
             conversation._searchExecutedTurn = currentTurn;
           } else if (toolName === "get_page_content") {
             result = await toolFunc(params, undefined, secProps);
+            conversation._pageContentFetched = true;
+            if (Array.isArray(result)) {
+              result = result.map(r =>
+                typeof r === "string" ? replaceUrlsWithIds(r, urlIdMap) : r
+              );
+            }
           } else {
             result = await toolFunc(params, secProps);
           }
