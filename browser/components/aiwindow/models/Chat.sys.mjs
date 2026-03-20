@@ -153,7 +153,7 @@ Object.assign(Chat, {
             body: "ERROR: run_search tool call error: You may only run one search per user message. Respond to the user with what you have already found and ask if they want you to proceed with the next search. Do not hallucinate search results.",
             name: tc.function.name,
           };
-          conversation.addToolCallMessage(content, currentTurn, toolRoleOpts);
+          conversation.addToolCallMessage(content, toolRoleOpts);
         }
 
         if (blockedSearchAttempts === MAX_RUN_SEARCH_PER_TURN) {
@@ -161,6 +161,7 @@ Object.assign(Chat, {
             t => t.function?.name !== "run_search"
           );
         }
+        conversation.addAssistantMessage("text", "");
         continue;
       }
 
@@ -191,7 +192,7 @@ Object.assign(Chat, {
             tool_call_id: id,
             body: { error: "Invalid JSON arguments" },
           };
-          conversation.addToolCallMessage(content, currentTurn, toolRoleOpts);
+          conversation.addToolCallMessage(content, toolRoleOpts);
           continue;
         }
 
@@ -220,7 +221,13 @@ Object.assign(Chat, {
               console.error(
                 "run_search: No browsingContext provided, aborting search handoff"
               );
-              return;
+              const content = {
+                tool_call_id: id,
+                body: { error: "run_search is not available in this context" },
+                name: toolName,
+              };
+              conversation.addToolCallMessage(content, toolRoleOpts);
+              break;
             }
             searchHandoffBrowser = context.browsingContext.embedderElement;
             result = await toolFunc(params ?? {}, context, secProps);
@@ -249,11 +256,11 @@ Object.assign(Chat, {
           );
 
           const content = { tool_call_id: id, body: result, name: toolName };
-          conversation.addToolCallMessage(content, currentTurn, toolRoleOpts);
+          conversation.addToolCallMessage(content, toolRoleOpts);
         } catch (e) {
           result = { error: `Tool execution failed: ${String(e)}` };
           const content = { tool_call_id: id, body: result };
-          conversation.addToolCallMessage(content, currentTurn, toolRoleOpts);
+          conversation.addToolCallMessage(content, toolRoleOpts);
         }
 
         lazy.AIWindow.chatStore
@@ -292,6 +299,10 @@ Object.assign(Chat, {
         // @todo Bug 2006159 - Implement parallel tool calling
         break;
       }
+
+      // Add a fresh text placeholder so the follow-up response is ordered
+      // after the tool call/result messages, not before them.
+      conversation.addAssistantMessage("text", "");
 
       // Commit flags once all tool calls in this batch have finished so that
       // no tool call can observe flags staged by a sibling call.

@@ -674,7 +674,28 @@ export class ChatConversation extends EventEmitter {
       msgsForAPI.splice(lastUserMsgIdx, 0, ...contextMsgs);
     }
 
-    return msgsForAPI;
+    // Merge consecutive assistant text + tool_calls messages into one.
+    // Models that emit reasoning tokens (e.g. <think>…</think>) before a tool
+    // call produce two adjacent assistant messages; the API requires a single
+    // message with both content and tool_calls.
+    const merged = [];
+    for (let i = 0; i < msgsForAPI.length; i++) {
+      const msg = msgsForAPI[i];
+      const next = msgsForAPI[i + 1];
+      if (
+        msg.role === "assistant" &&
+        msg.content &&
+        !msg.tool_calls &&
+        next?.role === "assistant" &&
+        next?.tool_calls
+      ) {
+        merged.push({ ...next, content: msg.content });
+        i++;
+      } else {
+        merged.push(msg);
+      }
+    }
+    return merged;
   }
 
   #updateActiveBranchTipMessageId() {
